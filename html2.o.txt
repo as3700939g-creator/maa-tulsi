@@ -1,0 +1,538 @@
+```name=backend/package.json
+{
+  "name": "maa-tulsi-study-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "bad-words": "^3.0.4",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "mongoose": "^7.2.0",
+    "multer": "^1.4.5-lts.1"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
+```const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const multer = require('multer');
+const path = require('path');
+const Filter = require('bad-words');
+const fs = require('fs');
+
+const User = require('./models/User');
+const Note = require('./models/Note');
+const Question = require('./models/Question');
+
+const app = express();
+const filter = new Filter();
+
+require('dotenv').config();
+
+const MONGO = process.env.MONGO_URI || 'mongodb://localhost:27017/maatulsistudy';
+const JWT_SECRET = process.env.JWT_SECRET || 'replace_this_secret_for_prod';
+
+mongoose.connect(MONGO, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(()=> console.log('Mongo connected'))
+  .catch(err => console.error(err));
+
+app.use(cors());
+app.use(express.json());
+app.use('/public', express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Multer setup
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, 'uploads/'),
+  filename: (req, file, cb) => {
+    const unique = Date.now() + '-' + Math.round(Math.random()*1e9);
+    cb(null, unique + path.extname(file.originalname));
+  }
+});
+const allowedMime = ['application/pdf','image/jpeg','image/png'];
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    if (!allowedMime.includes(file.mimetype)) {
+      return cb(new Error('Only PDF/PNG/JPEG allowed'));
+    }
+    cb(null, true);
+  }
+});
+
+// Middleware: auth
+function auth(req, res, next) {
+  const h = req.headers.authorization;
+  if (!h) return res.status(401).send({ error: 'Login required' });
+  const token = h.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch (e) {
+    return res.status(401).send({ error: 'Invalid token' });
+  }
+}
+
+// Middleware: profanity/content filter for text fields
+function contentFilterText(fields = []) {
+  return (req, res, next) => {
+    for (const f of fields) {
+      const v = req.body[f];
+      if (!v) continue;
+      if (filter.isProfane(v)) {
+        return res.status(400).send({ error: 'Inappropriate content detected — blocked' });
+      }
+    }
+    next();
+  };
+}
+
+// Auth routes
+app.post('/api/auth/register', contentFilterText(['username','email']), async (req, res) => {
+  const { username, email, password } = req.body;
+  if (!username || !email || !password) return res.status(400).send({ error: 'Missing fields' });
+  const exists = await User.findOne({ email });
+  if (exists) return res.status(400).send({ error: 'Email already used' });
+  const hash = await bcrypt.hash(password, 10);
+  const user = await User.create({ username, email, password: hash, role: 'student' });
+  const token = jwt.sign({ id: user._id, email: user.email, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+  res.send({ token, username: user.username });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email });
+  if (!user) return res.status(400).send({ error: 'Invalid credentials' });
+  const ok = await bcrypt.compare(password, user.password);
+  if (!ok) return res.status(400).send({ error: 'Invalid credentials' });
+  const token = jwt.sign({ id: user._id, email: user.email, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+  res.send({ token, username: user.username });
+});
+
+// Notes: upload
+app.post('/api/notes', auth, upload.single('file'), contentFilterText(['title','description']), async (req, res) => {
+  try {
+    const { title, subject, classLevel, description } = req.body;
+    if (!title || !subject || !classLevel) {
+      if (req.file) fs.unlinkSync(req.file.path);
+      return res.status(400).send({ error: 'Missing fields' });
+    }
+    // If bad-words flagged inside file name or description, block earlier - done by content filter
+    const note = await Note.create({
+      title, subject, classLevel, description,
+      filename: req.file ? req.file.filename : null,
+      originalname: req.file ? req.file.originalname : null,
+      uploader: req.user.id
+    });
+    res.send({ note });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ error: 'Upload failed' });
+  }
+});
+
+app.get('/api/notes', auth, async (req, res) => {
+  const { subject, classLevel } = req.query;
+  const q = {};
+  if (subject) q.subject = subject;
+  if (classLevel) q.classLevel = classLevel;
+  const notes = await Note.find(q).populate('uploader','username').sort({ createdAt: -1 });
+  res.send({ notes });
+});
+
+// Questions: ask & answer
+app.post('/api/questions', auth, contentFilterText(['text']), async (req, res) => {
+  const { text, subject, classLevel } = req.body;
+  if (!text || !subject || !classLevel) return res.status(400).send({ error: 'Missing fields' });
+  const q = await Question.create({
+    text, subject, classLevel, askedBy: req.user.id
+  });
+  res.send({ question: q });
+});
+
+app.get('/api/questions', auth, async (req, res) => {
+  const qs = await Question.find().populate('askedBy','username').sort({ createdAt: -1 });
+  res.send({ questions: qs });
+});
+
+app.post('/api/questions/:id/answer', auth, contentFilterText(['answerText']), async (req, res) => {
+  const id = req.params.id;
+  const { answerText } = req.body;
+  if (!answerText) return res.status(400).send({ error: 'Missing answer' });
+  const q = await Question.findById(id);
+  if (!q) return res.status(404).send({ error: 'Question not found' });
+  if (filter.isProfane(answerText)) return res.status(400).send({ error: 'Inappropriate content detected — blocked' });
+  q.answers.push({ text: answerText, answeredBy: req.user.id });
+  await q.save();
+  res.send({ question: q });
+});
+
+// Simple health
+app.get('/', (req, res) => res.send({ message: 'Maa Tulsi Study API' }));
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, ()=> console.log('Server running on', PORT));const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
+
+const UserSchema = new Schema({
+  username: { type: String, required: true },
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  role: { type: String, default: 'student' }
+}, { timestamps: true });
+
+module.exports = mongoose.model('User', UserSchema);const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
+
+const NoteSchema = new Schema({
+  title: String,
+  subject: String,
+  classLevel: String,
+  description: String,
+  filename: String,
+  originalname: String,
+  uploader: { type: Schema.Types.ObjectId, ref: 'User' }
+}, { timestamps: true });
+
+module.exports = mongoose.model('Note', NoteSchema);const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
+
+const AnswerSchema = new Schema({
+  text: String,
+  answeredBy: { type: Schema.Types.ObjectId, ref: 'User' },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const QuestionSchema = new Schema({
+  text: String,
+  subject: String,
+  classLevel: String,
+  askedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+  answers: [AnswerSchema]
+}, { timestamps: true });
+
+module.exports = mongoose.model('Question', QuestionSchema);# Create this file locally and set real values
+MONGO_URI=mongodb://localhost:27017/maatulsistudy
+JWT_SECRET=replace_with_a_secure_random_string
+````markdown
+```name=frontend/package.json
+{
+  "name": "maa-tulsi-study-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "PORT=3000 react-scripts start",
+    "build": "react-scripts build"
+  }
+}
+``````name=frontend/public/index.html
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Maa Tulsi Study</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
+```(Place your Krishna image here with filename krishna.jpg — add a devotional/background image you have rights to)```name=frontend/src/index.js
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './styles.css';
+
+createRoot(document.getElementById('root')).render(<App />);import React, { useState, useEffect } from 'react';
+import Login from './Login';
+import Register from './Register';
+import Dashboard from './Dashboard';
+
+function App(){
+  const [token, setToken] = useState(localStorage.getItem('token'));
+  const [username, setUsername] = useState(localStorage.getItem('username'));
+
+  useEffect(()=> {
+    if (token) {
+      localStorage.setItem('token', token);
+      localStorage.setItem('username', username || '');
+    } else {
+      localStorage.removeItem('token');
+      localStorage.removeItem('username');
+    }
+  }, [token, username]);
+
+  if (!token) {
+    return (
+      <div className="auth-wrapper">
+        <div className="card">
+          <h1>Maa Tulsi Study</h1>
+          <Login onLogin={(t, u)=>{ setToken(t); setUsername(u); }} />
+          <hr />
+          <Register onRegister={(t, u)=>{ setToken(t); setUsername(u); }} />
+        </div>
+      </div>
+    );
+  }
+
+  return <Dashboard token={token} username={username} onLogout={()=>{ setToken(null); setUsername(null); }} />;
+}
+
+export default App;import React, { useState } from 'react';
+
+export default function Login({ onLogin }){
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [err,setErr] = useState('');
+
+  async function submit(e){
+    e.preventDefault();
+    setErr('');
+    try {
+      const res = await fetch('http://localhost:5000/api/auth/login', {
+        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ email, password })
+      });
+      const data = await res.json();
+      if (!res.ok) return setErr(data.error || 'Login failed');
+      onLogin(data.token, data.username);
+    } catch(e) { setErr('Network error'); }
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <h3>Login</h3>
+      <input placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} />
+      <input placeholder="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} />
+      <button type="submit">Login</button>
+      <div className="error">{err}</div>
+    </form>
+  );
+}import React, { useState } from 'react';
+
+export default function Register({ onRegister }){
+  const [username, setUsername] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [msg, setMsg] = useState('');
+
+  async function submit(e){
+    e.preventDefault();
+    setMsg('');
+    try {
+      const res = await fetch('http://localhost:5000/api/auth/register', {
+        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username, email, password })
+      });
+      const data = await res.json();
+      if (!res.ok) return setMsg(data.error || 'Registration failed');
+      onRegister(data.token, data.username);
+    } catch(e) { setMsg('Network error'); }
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <h3>Register</h3>
+      <input placeholder="Username" value={username} onChange={e=>setUsername(e.target.value)} />
+      <input placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} />
+      <input placeholder="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} />
+      <button type="submit">Register</button>
+      <div className="error">{msg}</div>
+    </form>
+  );
+}import React, { useEffect, useState } from 'react';
+import UploadNote from './UploadNote';
+import AskQuestion from './AskQuestion';
+
+export default function Dashboard({ token, username, onLogout }) {
+  const [notes, setNotes] = useState([]);
+  const [questions, setQuestions] = useState([]);
+
+  async function fetchNotes() {
+    const res = await fetch('http://localhost:5000/api/notes', { headers: { Authorization: 'Bearer ' + token }});
+    const d = await res.json();
+    if (res.ok) setNotes(d.notes);
+  }
+  async function fetchQuestions() {
+    const res = await fetch('http://localhost:5000/api/questions', { headers: { Authorization: 'Bearer ' + token }});
+    const d = await res.json();
+    if (res.ok) setQuestions(d.questions);
+  }
+
+  useEffect(()=> { fetchNotes(); fetchQuestions(); }, []);
+
+  return (
+    <div className="app">
+      <div className="topbar">
+        <h2>Maa Tulsi Study</h2>
+        <div>
+          <span>Welcome, {username}</span>
+          <button onClick={onLogout}>Logout</button>
+        </div>
+      </div>
+
+      <div className="container">
+        <div className="left">
+          <UploadNote token={token} onUploaded={fetchNotes} />
+          <h3>Notes</h3>
+          {notes.map(n => (
+            <div key={n._id} className="card">
+              <b>{n.title}</b> <small>({n.subject} - Class {n.classLevel})</small>
+              <p>{n.description}</p>
+              {n.filename && <a href={`http://localhost:5000/uploads/${n.filename}`} target="_blank" rel="noreferrer">Download</a>}
+              <div className="meta">By {n.uploader?.username || 'Unknown'}</div>
+            </div>
+          ))}
+        </div>
+        <div className="right">
+          <AskQuestion token={token} onAsked={fetchQuestions} />
+          <h3>Questions</h3>
+          {questions.map(q => (
+            <div key={q._id} className="card">
+              <b>{q.text}</b>
+              <div><small>{q.subject} - Class {q.classLevel}</small></div>
+              <div className="meta">Asked by: {q.askedBy?.username || 'User'}</div>
+              {q.answers && q.answers.map(a => <div className="answer" key={a._id}><b>Answer:</b> {a.text}</div>)}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}import React, { useState } from 'react';
+
+export default function UploadNote({ token, onUploaded }) {
+  const [title, setTitle] = useState('');
+  const [subject, setSubject] = useState('');
+  const [classLevel, setClassLevel] = useState('');
+  const [description, setDescription] = useState('');
+  const [file, setFile] = useState(null);
+  const [msg, setMsg] = useState('');
+
+  async function submit(e) {
+    e.preventDefault();
+    setMsg('');
+    const fd = new FormData();
+    fd.append('title', title);
+    fd.append('subject', subject);
+    fd.append('classLevel', classLevel);
+    fd.append('description', description);
+    if (file) fd.append('file', file);
+    const res = await fetch('http://localhost:5000/api/notes', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token },
+      body: fd
+    });
+    const data = await res.json();
+    if (!res.ok) setMsg(data.error || 'Upload failed');
+    else { setMsg('Uploaded'); setTitle(''); setSubject(''); setClassLevel(''); setDescription(''); setFile(null); onUploaded(); }
+  }
+
+  return (
+    <form onSubmit={submit} className="card">
+      <h3>Upload Notes</h3>
+      <input placeholder="Title" value={title} onChange={e=>setTitle(e.target.value)} />
+      <input placeholder="Subject" value={subject} onChange={e=>setSubject(e.target.value)} />
+      <input placeholder="Class (e.g. 9, 10, 11, 12)" value={classLevel} onChange={e=>setClassLevel(e.target.value)} />
+      <textarea placeholder="Description" value={description} onChange={e=>setDescription(e.target.value)} />
+      <input type="file" onChange={e=>setFile(e.target.files[0])} />
+      <button type="submit">Upload</button>
+      <div className="error">{msg}</div>
+    </form>
+  );
+}import React, { useState } from 'react';
+
+export default function AskQuestion({ token, onAsked }) {
+  const [text, setText] = useState('');
+  const [subject, setSubject] = useState('');
+  const [classLevel, setClassLevel] = useState('');
+  const [msg, setMsg] = useState('');
+
+  async function submit(e) {
+    e.preventDefault();
+    setMsg('');
+    const res = await fetch('http://localhost:5000/api/questions', {
+      method: 'POST', headers: { 'Content-Type':'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({ text, subject, classLevel })
+    });
+    const data = await res.json();
+    if (!res.ok) setMsg(data.error || 'Failed');
+    else { setMsg('Question added'); setText(''); onAsked(); }
+  }
+
+  return (
+    <form onSubmit={submit} className="card">
+      <h3>Ask a Question</h3>
+      <textarea placeholder="Your question" value={text} onChange={e=>setText(e.target.value)} />
+      <input placeholder="Subject" value={subject} onChange={e=>setSubject(e.target.value)} />
+      <input placeholder="Class" value={classLevel} onChange={e=>setClassLevel(e.target.value)} />
+      <button type="submit">Ask</button>
+      <div className="error">{msg}</div>
+    </form>
+  );
+}body, html, #root { height: 100%; margin: 0; font-family: Arial, sans-serif; }
+.app {
+  min-height: 100%;
+  background-image: url('/krishna.jpg');
+  background-size: cover;
+  background-position: center;
+  padding-bottom: 40px;
+}
+.topbar {
+  display:flex; justify-content:space-between; align-items:center; padding:10px 20px; background: rgba(255,255,255,0.85);
+}
+.container { display:flex; gap:20px; padding:20px; }
+.left, .right { flex:1; max-width:48%; }
+.card { background: rgba(255,255,255,0.85); padding:15px; margin-bottom:10px; border-radius:6px; }
+input, textarea { width:100%; padding:8px; margin:6px 0; border:1px solid #ccc; border-radius:4px; }
+button { padding:8px 12px; border:none; background:#2b6cb0; color:white; border-radius:4px; cursor:pointer; }
+.error { color: red; margin-top:8px; }
+.auth-wrapper { display:flex; align-items:center; justify-content:center; height:100%; background-image: url('/krishna.jpg'); background-size: cover; background-position: center; }
+.auth-wrapper .card { width:360px; background: rgba(255,255,255,0.9); padding:20px; border-radius:8px; }
+.meta { font-size:12px; color:#333; margin-top:6px; }
+.answer { margin-top:8px; padding:8px; background:#f7f7f7; border-radius:4px; }
+Important security & moderation notes (zaruri):
+- Yeh sample implementation basic profanity detection ke liye "bad-words" package use karta hai. Yeh perfect nahi hai — aapko Hindi/Regional profanity lists aur ML-based image moderation (e.g., Google Vision SafeSearch / AWS Rekognition / third-party moderation APIs) add karna chahiye taaki images ya complex hate/sexual content bhi block ho.
+- File uploads ke liye currently size and MIME checks hain. Production me virus scan aur content moderation jaruri hai.
+- Use HTTPS in production; set secure JWT secret and shorter token lifetimes + refresh tokens if chahte ho.
+- Rate limiting (express-rate-limit), helmet (security headers), input validation (Joi/Zod), and admin moderation panel add karna recommended hai.
+- User reporting/flagging feature add karen taaki community-moderation possible ho.
+
+Kaise chalaye (local):
+1. Backend:
+   - cd backend
+   - npm install
+   - create `.env` with MONGO_URI and JWT_SECRET
+   - mkdir uploads public
+   - put krishna.jpg in backend/public if chahen serve karne ke liye
+   - npm run dev (ya npm start)
+2. Frontend:
+   - cd frontend
+   - npm install
+   - place krishna.jpg in frontend/public
+   - npm start
+
+Agar aap chahte hain to main:
+- Isme Hindi profanity list add kar doon,
+- Admin moderation panel aur "report" button bana doon,
+- Dockerfile + docker-compose for easy deployment bana doon,
+- Ya Next.js + serverless functions me migrate kar doon (Vercel deploy friendly).
+
+Bataiye kaunsa extra feature chahiye — main aapke liye next step code bana dunga (admin moderation, reporting, Hindi profanity list, image moderation integration, ya Docker setup).
+```
+PORT=5000
